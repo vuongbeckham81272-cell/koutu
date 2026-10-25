@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: "--bundles nsis"
+          - platform: macos-14
+            args: "--bundles dmg --target aarch64-apple-darwin"
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+      - name: Download BiRefNet model
+        run: |
+          mkdir -p src-tauri/models
+          curl -sL --retry 3 -o src-tauri/models/BiRefNet_lite.onnx \
+            "https://huggingface.co/onnx-community/BiRefNet_lite-ONNX/resolve/main/onnx/model.onnx"
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "硬边抠图 ${{ github.ref_name }}"
+          releaseBody: |
+            本地离线 AI 抠图工具。模型随安装包分发，无需联网。
+            提供 Windows（x64）与 macOS（Apple Silicon）两个版本。
+          releaseDraft: false
+          args: ${{ matrix.args }}
