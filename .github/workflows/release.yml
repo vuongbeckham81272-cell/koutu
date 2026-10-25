@@ -29,6 +29,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Download BiRefNet model
+        shell: bash
         run: |
           mkdir -p src-tauri/models
           curl -sL --retry 3 -o src-tauri/models/BiRefNet_lite.onnx \
@@ -39,6 +40,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MACOSX_DEPLOYMENT_TARGET: 13.4
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "硬边抠图 ${{ github.ref_name }}"
