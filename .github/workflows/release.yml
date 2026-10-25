@@ -30,6 +30,11 @@ jobs:
           node-version: 22
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: macOS linker fix
+        if: matrix.platform == 'macos-14'
+        run: |
+          RD=$(clang --print-resource-dir)
+          echo "RUSTFLAGS=-C link-arg=-target -C link-arg=arm64-apple-macos13.4.0 -C link-arg=-L$RD/lib/darwin -C link-arg=-lclang_rt.osx" >> "$GITHUB_ENV"
       - name: Download BiRefNet model
         shell: bash
         run: |
