@@ -20,6 +20,8 @@ jobs:
           - platform: macos-14
             args: "--bundles dmg --target aarch64-apple-darwin"
     runs-on: ${{ matrix.platform }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: 13.4
     steps:
       - uses: actions/checkout@v4
       - name: Setup Node
@@ -40,7 +42,6 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MACOSX_DEPLOYMENT_TARGET: 13.4
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "硬边抠图 ${{ github.ref_name }}"
