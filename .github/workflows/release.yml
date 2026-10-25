@@ -6,6 +6,9 @@ on:
       - "v*"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -24,7 +27,7 @@ jobs:
         with:
           node-version: 22
       - name: Setup Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
       - name: Download BiRefNet model
         run: |
           mkdir -p src-tauri/models
