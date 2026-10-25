@@ -32,10 +32,18 @@ export default function PreviewView({
   const dragRef = useRef<{ x: number; y: number; tx: number; ty: number } | null>(null);
   const downPosRef = useRef<{ x: number; y: number } | null>(null);
   const layoutRef = useRef<{ iw: number; ih: number }>({ iw: 0, ih: 0 });
+  // 单击计数（用于双击选文件 / 三击复位视图）
+  const clickCountRef = useRef(0);
+  const clickTimerRef = useRef<number | null>(null);
 
-  // 切换图片时重置变换
+  // 切换图片时重置变换与点击计数
   useEffect(() => {
     setTransform({ scale: 1, tx: 0, ty: 0 });
+    clickCountRef.current = 0;
+    if (clickTimerRef.current !== null) {
+      clearTimeout(clickTimerRef.current);
+      clickTimerRef.current = null;
+    }
   }, [src]);
 
   // 滚轮缩放（React onWheel 是 passive，需要用 ref 自行挂载才能 preventDefault）
@@ -78,18 +86,34 @@ export default function PreviewView({
     dragRef.current = { x: e.clientX, y: e.clientY, tx: transform.tx, ty: transform.ty };
   };
 
-  const onDoubleClick = () => {
-    if (mode === "erase") return; // 擦除模式下双击不打开选图，避免误触
-    onRequestPick?.();
+  // 单击计数（延迟 350ms 判定，兼容双击与三击两种手势）：
+  //   双击（350ms 内点 2 次）-> 打开文件选择窗口
+  //   三击（350ms 内点 3 次）-> 复位视图到刚导入的状态（缩放 100%、居中），不弹文件框
+  const registerClick = () => {
+    clickCountRef.current += 1;
+    if (clickTimerRef.current !== null) clearTimeout(clickTimerRef.current);
+    clickTimerRef.current = window.setTimeout(() => {
+      const c = clickCountRef.current;
+      clickCountRef.current = 0;
+      clickTimerRef.current = null;
+      if (c >= 3) {
+        setTransform({ scale: 1, tx: 0, ty: 0 });
+      } else if (c === 2) {
+        onRequestPick?.();
+      }
+    }, 350);
   };
 
   const onClick = (e: ReactMouseEvent) => {
-    if (mode !== "erase") return;
-    // 拖拽平移后的松手不算"点击擦除"：位移超过 4px 忽略
+    // 拖拽平移后的松手不算"点击"：位移超过 4px 忽略
     const d = downPosRef.current;
     if (d && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 4) return;
-    const p = toImageCoords(e.clientX, e.clientY);
-    if (p) onEraseClick?.(p);
+    if (mode === "erase") {
+      const p = toImageCoords(e.clientX, e.clientY);
+      if (p) onEraseClick?.(p);
+      return;
+    }
+    registerClick();
   };
 
   // 屏幕坐标 -> 原图像素坐标（为第 9 项橡皮擦预留，本轮已可用）
@@ -129,7 +153,6 @@ export default function PreviewView({
         draggable={false}
         onMouseDown={onMouseDown}
         onClick={onClick}
-        onDoubleClick={onDoubleClick}
         onLoad={(e) => {
           layoutRef.current = {
             iw: e.currentTarget.naturalWidth,

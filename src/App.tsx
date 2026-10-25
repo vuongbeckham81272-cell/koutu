@@ -20,10 +20,11 @@ function baseName(path: string) {
   return path.split(/[\\/]/).pop() ?? path;
 }
 
-function cutoutName(path: string) {
-  const name = baseName(path);
+// 抠图结果永远是透明 PNG（修复：此前保留原扩展名导致导出 .jpg 变白底）
+function cutoutName(name: string, suffix = "-cutout") {
   const dot = name.lastIndexOf(".");
-  return dot > 0 ? `${name.slice(0, dot)}-cutout${name.slice(dot)}` : `${name}-cutout.png`;
+  const base = dot > 0 ? name.slice(0, dot) : name;
+  return `${base}${suffix}.png`;
 }
 
 function bytesToDataUrl(bytes: Uint8Array, mime = "image/png") {
@@ -42,6 +43,8 @@ function App() {
   const [dragOver, setDragOver] = useState(false);
   const [modelStatus, setModelStatus] = useState<ModelStatus>("loading");
   const [modelError, setModelError] = useState("");
+  const [backend, setBackend] = useState<"gpu" | "cpu">("cpu");
+  const [gpuAccel, setGpuAccel] = useState(true);
   const [stage, setStage] = useState<Stage>("idle");
   const [status, setStatus] = useState("");
   const [hardEdge, setHardEdge] = useState(false);
@@ -55,6 +58,9 @@ function App() {
   const [sourcePath, setSourcePath] = useState("");
   const [batchQueue, setBatchQueue] = useState<BatchItem[]>([]);
   const [batchRunning, setBatchRunning] = useState(false);
+  // 导出设置：按百分比缩放（10~200，100=原尺寸）+ 批量文件名后缀
+  const [exportPercent, setExportPercent] = useState(100);
+  const [exportSuffix, setExportSuffix] = useState("-cutout");
 
   const running = stage !== "idle" && stage !== "done";
   const busy = modelStatus !== "ready" || running || batchRunning;
@@ -68,6 +74,10 @@ function App() {
   hardEdgeRef.current = hardEdge;
   const smoothEdgeRef = useRef(smoothEdge);
   smoothEdgeRef.current = smoothEdge;
+  const exportPercentRef = useRef(exportPercent);
+  exportPercentRef.current = exportPercent;
+  const exportSuffixRef = useRef(exportSuffix);
+  exportSuffixRef.current = exportSuffix;
 
   const currentBatchIdRef = useRef<string | null>(null);
   const lastDropTsRef = useRef(0);
@@ -75,18 +85,23 @@ function App() {
   // 模型状态 + 管线阶段事件
   useEffect(() => {
     invoke<string>("get_model_status").then((s) => {
-      if (s === "ready") setModelStatus("ready");
-      else if (s.startsWith("error")) {
+      if (s === "ready" || s === "ready:gpu" || s === "ready:cpu") {
+        setModelStatus("ready");
+        setBackend(s === "ready:gpu" ? "gpu" : "cpu");
+      } else if (s.startsWith("error")) {
         setModelStatus("error");
         setModelError(s.slice(7));
       }
     });
     const unlistenStatus = listen<string>("model-status", (e) => {
       const s = e.payload;
-      if (s === "ready") {
+      if (s === "ready" || s === "ready:gpu" || s === "ready:cpu") {
         setModelStatus("ready");
+        setBackend(s === "ready:gpu" ? "gpu" : "cpu");
         setModelError("");
-        setStatus("模型已就绪，可以开始抠图");
+        setStatus(
+          `模型已就绪，可以开始抠图（${s === "ready:gpu" ? "GPU 加速" : "CPU 模式"}）`,
+        );
       } else if (s === "loading") {
         setModelStatus("loading");
       } else if (s.startsWith("error:")) {
@@ -235,11 +250,20 @@ function App() {
             hardEdge: hardEdgeRef.current,
             smooth: smoothEdgeRef.current,
           });
+          // 按百分比缩放导出（100 = 原尺寸，跳过缩放）
+          let outBytes: number[] = png;
+          if (exportPercentRef.current !== 100) {
+            outBytes = await invoke<number[]>("resize_png", {
+              pngBytes: png,
+              percent: exportPercentRef.current,
+            });
+          }
           // 自动保存到：有原始路径则存回原图所在文件夹；否则存到下载目录
+          // 结果永远导出为透明 PNG（.jpg 无法保存透明通道）
           const outDir = item.path ? dirOf(item.path) : downloads;
-          const outName = cutoutName(item.name);
+          const outName = cutoutName(item.name, exportSuffixRef.current || "-cutout");
           const outPath = `${outDir}/${outName}`;
-          await invoke("save_png", { bytes: Array.from(png), path: outPath });
+          await invoke("save_png", { bytes: outBytes, path: outPath });
           setBatchQueue((q) =>
             q.map((x) => (x.id === item.id ? { ...x, status: "done", progress: 100 } : x)),
           );
@@ -302,18 +326,33 @@ function App() {
   const download = useCallback(async () => {
     if (!resultBytes) return;
     const dest = await save({
-      title: "保存透明 PNG",
-      defaultPath: sourcePath ? cutoutName(sourcePath) : "cutout.png",
+      title: "保存透明 PNG（可在弹窗中修改文件名）",
+      defaultPath: sourcePath ? cutoutName(sourcePath, exportSuffixRef.current || "-cutout") : "cutout.png",
       filters: [{ name: "PNG", extensions: ["png"] }],
     });
     if (!dest) return;
     try {
-      await invoke("save_png", { bytes: Array.from(resultBytes), path: dest });
-      setStatus(`已保存：${dest}`);
+      let bytes = Array.from(resultBytes);
+      if (exportPercentRef.current !== 100) {
+        bytes = await invoke<number[]>("resize_png", {
+          pngBytes: bytes,
+          percent: exportPercentRef.current,
+        });
+      }
+      await invoke("save_png", { bytes, path: dest });
+      setStatus(
+        `已保存：${dest}${exportPercentRef.current !== 100 ? `（尺寸 ${exportPercentRef.current}%）` : ""}`,
+      );
     } catch (e) {
       setStatus(`保存失败：${e}`);
     }
   }, [resultBytes, sourcePath]);
+
+  // 清空批量列表（清屏）：结果保留，仅移除列表记录
+  const clearBatchList = useCallback(() => {
+    setBatchQueue([]);
+    setStatus("");
+  }, []);
 
   // 批量处理：按需求 3，只选"文件夹"，自动处理其中所有支持的图片
   const batchProcess = useCallback(async () => {
@@ -406,6 +445,23 @@ function App() {
             />
             边缘平滑
           </label>
+          <label className="toggle" title="开启后优先使用 GPU 加速（Windows: DirectML，macOS: CoreML），不支持的算子自动回退 CPU，即 CPU+GPU 混合执行；无显卡或驱动异常时自动以 CPU 运行">
+            <input
+              type="checkbox"
+              checked={gpuAccel}
+              onChange={async (e) => {
+                const v = e.target.checked;
+                setGpuAccel(v);
+                try {
+                  await invoke("reload_model", { useGpu: v });
+                } catch (err) {
+                  setModelError(String(err));
+                }
+              }}
+              disabled={modelStatus !== "ready" || running || batchRunning}
+            />
+            GPU 加速
+          </label>
           <div className="view-toggle">
             <button
               className={view === "original" ? "active" : ""}
@@ -426,7 +482,7 @@ function App() {
             {modelStatus === "loading"
               ? "模型加载中"
               : modelStatus === "ready"
-                ? "模型就绪"
+                ? `模型就绪 · ${backend === "gpu" ? "GPU" : "CPU"}`
                 : "模型加载失败"}
           </span>
           {resultUrl && (
@@ -483,7 +539,7 @@ function App() {
             <div className="spinner" />
             <p>
               {stage === "inference"
-                ? "推理中（约 20~35 秒，请稍候）..."
+                ? "推理中（GPU 约 2~10 秒 / CPU 约 20~35 秒）..."
                 : stage === "postprocess"
                   ? "后处理中..."
                   : "编码中..."}
@@ -501,7 +557,7 @@ function App() {
             onClose={resultUrl ? closeResult : undefined}
           />
         ) : (
-          <p>把图片拖到这里，或双击选择文件</p>
+          <p>单击选择单张图片，或一次性拖入多张批量处理；也可点「批量处理」选文件夹</p>
         )}
       </section>
 
@@ -521,12 +577,47 @@ function App() {
       )}
 
       <footer className="footer">
-        <button className="download-btn" onClick={download} disabled={downloadDisabled}>
-          下载透明 PNG
-        </button>
-        <button className="test-btn" onClick={batchProcess} disabled={busy}>
-          批量处理
-        </button>
+        <div className="export-row" title="导出设置">
+          <label>
+            导出尺寸
+            <input
+              type="number"
+              min={10}
+              max={200}
+              step={5}
+              value={exportPercent}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                setExportPercent(Number.isNaN(v) ? 100 : Math.min(200, Math.max(10, v)));
+              }}
+              disabled={batchRunning}
+            />
+            %
+          </label>
+          <label title="批量导出时的文件名后缀，如 photo.jpg -> photo-cutout.png">
+            批量文件名后缀
+            <input
+              type="text"
+              value={exportSuffix}
+              onChange={(e) => setExportSuffix(e.target.value)}
+              placeholder="-cutout"
+              disabled={batchRunning}
+            />
+          </label>
+        </div>
+        <div className="footer-btns">
+          <button className="download-btn" onClick={download} disabled={downloadDisabled}>
+            下载透明 PNG
+          </button>
+          <button className="test-btn" onClick={batchProcess} disabled={busy}>
+            批量处理
+          </button>
+          {batchQueue.length > 0 && !batchRunning && (
+            <button className="test-btn" onClick={clearBatchList} title="清空批量列表记录">
+              清空列表
+            </button>
+          )}
+        </div>
       </footer>
     </main>
   );

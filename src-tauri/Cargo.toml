@@ -1,6 +1,6 @@
 [package]
 name = "koutu"
-version = "0.1.9"
+version = "0.2.3"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2024"
@@ -22,7 +22,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 image = "0.25"
-ort = { version = "=2.0.0-rc.15", features = ["ndarray", "download-binaries"] }
+ort = { version = "=2.0.0-rc.15", features = ["ndarray", "download-binaries", "directml", "coreml", "lax-feature-matching"] }
 ndarray = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

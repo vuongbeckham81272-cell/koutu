@@ -197,9 +197,61 @@
 .footer {
   flex: 0 0 auto;
   display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 0 0 24px;
+}
+
+.footer-btns {
+  display: flex;
   justify-content: center;
   gap: 12px;
-  padding: 0 0 24px;
+}
+
+/* 导出设置行：百分比尺寸 + 批量文件名后缀 */
+.export-row {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  font-size: 12px;
+  color: #9aa0aa;
+}
+
+.export-row label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.export-row input[type="number"] {
+  width: 56px;
+  padding: 4px 6px;
+  font-size: 12px;
+  color: #e8eaed;
+  background: #26282e;
+  border: 1px solid #3a3d44;
+  border-radius: 6px;
+  text-align: right;
+}
+
+.export-row input[type="text"] {
+  width: 84px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: #e8eaed;
+  background: #26282e;
+  border: 1px solid #3a3d44;
+  border-radius: 6px;
+}
+
+.export-row input:disabled {
+  opacity: 0.5;
+}
+
+.export-row input:focus {
+  outline: none;
+  border-color: #7dd48f;
 }
 
 .status {

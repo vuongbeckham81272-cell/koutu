@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use image::DynamicImage;
@@ -20,6 +21,10 @@ enum ModelState {
 
 struct ModelStatus {
     state: Mutex<ModelState>,
+    /// GPU 加速开关（用户可在界面切换，默认开）
+    use_gpu: AtomicBool,
+    /// 当前实际生效的后端："gpu" 或 "cpu"
+    backend: Mutex<String>,
 }
 
 // 读取用户选择的图片文件，返回原始字节
@@ -42,6 +47,25 @@ fn save_png(bytes: Vec<u8>, path: String) -> Result<String, String> {
     fs::create_dir_all(parent).map_err(|e| format!("无法创建目录: {e}"))?;
     fs::write(&dest, &bytes).map_err(|e| format!("保存失败: {e}"))?;
     Ok(dest.to_string_lossy().into_owned())
+}
+
+// 按百分比缩放透明 PNG（导出尺寸功能）：percent 10~200，100 原样返回
+#[tauri::command]
+fn resize_png(png_bytes: Vec<u8>, percent: i32) -> Result<Vec<u8>, String> {
+    let percent = percent.clamp(10, 200);
+    if percent == 100 {
+        return Ok(png_bytes);
+    }
+    let img = image::load_from_memory(&png_bytes)
+        .map_err(|e| format!("不是有效的 PNG 数据: {e}"))?;
+    let nw = ((img.width() as f64) * percent as f64 / 100.0).round().max(1.0) as u32;
+    let nh = ((img.height() as f64) * percent as f64 / 100.0).round().max(1.0) as u32;
+    let resized = img.resize_exact(nw, nh, image::imageops::FilterType::Triangle);
+    let mut out = Vec::new();
+    resized
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .map_err(|e| format!("PNG 编码失败: {e}"))?;
+    Ok(out)
 }
 
 // ---------------- 推理 ----------------
@@ -153,6 +177,56 @@ fn dilate_3x3(src: &[u8], w: usize, h: usize) -> Vec<u8> {
     dst
 }
 
+// alpha 重映射：low 以下清零（清除轮廓外残留的淡描边），low~high 线性拉伸为
+// 0~255 的窄羽化带（保持平滑无锯齿），high 以上全不透明。等效 PS 的"收缩蒙版"。
+fn remap_alpha(alpha: &mut [u8], low: f32, high: f32) {
+    for a in alpha.iter_mut() {
+        let v = *a as f32;
+        let nv = if v <= low {
+            0.0
+        } else if v >= high {
+            255.0
+        } else {
+            (v - low) / (high - low) * 255.0
+        };
+        *a = nv.round().clamp(0.0, 255.0) as u8;
+    }
+}
+
+// 边缘去杂色（defringe）：半透明边缘像素（0 < alpha < 250）的颜色替换为
+// 邻近（5x5 内）不透明前景像素的颜色，消除白底/黑底拍摄时残留的白色/黑色描边。
+fn defringe(rgb: &mut image::RgbImage, alpha: &[u8], w: u32, h: u32) {
+    let (wi, hi) = (w as i64, h as i64);
+    let snapshot = rgb.clone();
+    for y in 0..hi {
+        for x in 0..wi {
+            let i = (y * wi + x) as usize;
+            let a = alpha[i];
+            if a == 0 || a >= 250 {
+                continue;
+            }
+            let mut found: Option<image::Rgb<u8>> = None;
+            'search: for dy in -2i64..=2 {
+                for dx in -2i64..=2 {
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx < 0 || ny < 0 || nx >= wi || ny >= hi {
+                        continue;
+                    }
+                    let j = (ny * wi + nx) as usize;
+                    if alpha[j] >= 250 {
+                        found = Some(*snapshot.get_pixel(nx as u32, ny as u32));
+                        break 'search;
+                    }
+                }
+            }
+            if let Some(c) = found {
+                *rgb.get_pixel_mut(x as u32, y as u32) = c;
+            }
+        }
+    }
+}
+
 // 对图片做主体分割，返回 RGBA PNG
 #[tauri::command]
 fn segment_image(
@@ -215,6 +289,8 @@ fn segment_image_core(
         if smooth {
             if let Some(gray) = image::GrayImage::from_raw(orig_w, orig_h, alpha.clone()) {
                 alpha = image::imageops::blur(&gray, 1.0).into_raw();
+                // 收窄过渡带并压掉轮廓外侧的淡残留，同时保持平滑
+                remap_alpha(&mut alpha, 60.0, 200.0);
             }
         }
     } else {
@@ -228,13 +304,20 @@ fn segment_image_core(
         let opened = dilate_3x3(&eroded, orig_w as usize, orig_h as usize);
         if let Some(gray) = image::GrayImage::from_raw(orig_w, orig_h, opened.clone()) {
             alpha = image::imageops::blur(&gray, 1.2).into_raw();
+            // 关键：重映射 alpha——70 以下清零（去掉轮廓外残留的淡描边/黑线），
+            // 70~185 拉伸为 0~255 的窄羽化带（约 1px，平滑无锯齿），185 以上全不透明
+            remap_alpha(&mut alpha, 70.0, 185.0);
         } else {
             alpha = opened;
         }
     }
 
     // 4. 与原图 RGB 合成 RGBA PNG
-    let rgb = img.to_rgb8();
+    let mut rgb = img.to_rgb8();
+    // 5. 边缘去杂色（defringe）：半透明边缘像素的颜色换成邻近不透明前景色，
+    //    消除白底/黑底拍摄时边缘残留的白色/黑色描边
+    defringe(&mut rgb, &alpha, orig_w, orig_h);
+    let rgb = rgb;
     let mut rgba = image::RgbaImage::new(orig_w, orig_h);
     for (x, y, px) in rgba.enumerate_pixels_mut() {
         let i = (y as usize) * (orig_w as usize) + x as usize;
@@ -337,12 +420,72 @@ fn get_model_status(status: State<ModelStatus>) -> Result<String, String> {
     let st = status.state.lock().map_err(|_| "状态读取失败".to_string())?;
     Ok(match &*st {
         ModelState::Loading => "loading".to_string(),
-        ModelState::Ready => "ready".to_string(),
+        ModelState::Ready => {
+            let backend = status
+                .backend
+                .lock()
+                .map(|b| b.clone())
+                .unwrap_or_else(|_| "cpu".to_string());
+            format!("ready:{backend}")
+        }
         ModelState::Error(msg) => format!("error: {msg}"),
     })
 }
 
-// 加载或重载模型
+// 组装执行提供器（EP）列表：
+// - Windows: DirectML（DirectX 12，兼容 NVIDIA / AMD / Intel 显卡）
+// - macOS:  CoreML（Apple 神经引擎 / Metal GPU）
+// - CPU 始终注册在最后兜底
+// ORT 会把 GPU 不支持的算子自动分配给 CPU —— 即 CPU+GPU 混合执行。
+// gpu_strict=true 时 GPU 注册失败直接返回错误，由调用方回退纯 CPU。
+// gpu_strict 在无 GPU 平台（如 Linux）上不会被读取
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(unused_variables))]
+fn make_eps(use_gpu: bool, gpu_strict: bool) -> Vec<ort::ep::ExecutionProviderDispatch> {
+    let mut eps: Vec<ort::ep::ExecutionProviderDispatch> = Vec::new();
+    if use_gpu {
+        #[cfg(target_os = "windows")]
+        {
+            let dml = ort::ep::DirectML::default().build();
+            eps.push(if gpu_strict { dml.error_on_failure() } else { dml });
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let cml = ort::ep::CoreML::default().build();
+            eps.push(if gpu_strict { cml.error_on_failure() } else { cml });
+        }
+    }
+    eps.push(ort::ep::CPU::default().with_arena_allocator(false).build());
+    eps
+}
+
+// 用指定的 EP 组合创建推理会话
+fn build_session(
+    model_path: &std::path::Path,
+    use_gpu: bool,
+    gpu_strict: bool,
+) -> Result<Session, String> {
+    let environment = ort::init()
+        .with_name("koutu")
+        .build()
+        .map_err(|e| e.to_string())?;
+    Session::builder(&environment)
+        .map_err(|e| e.to_string())?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(|e| e.to_string())?
+        // CPU 线程放开到全部核心：GPU 跑算子时 CPU 侧同样并行工作
+        .with_intra_threads(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4),
+        )
+        .map_err(|e| e.to_string())?
+        .with_execution_providers(make_eps(use_gpu, gpu_strict))
+        .map_err(|e| e.to_string())?
+        .commit_from_file(model_path)
+        .map_err(|e| format!("模型加载失败: {e}"))
+}
+
+// 加载或重载模型：优先 GPU+CPU 混合；GPU 不可用时自动回退纯 CPU
 fn load_model(app: &AppHandle, status: &ModelStatus) -> Result<(), String> {
     {
         let mut st = status.state.lock().map_err(|_| "状态锁失败".to_string())?;
@@ -350,31 +493,27 @@ fn load_model(app: &AppHandle, status: &ModelStatus) -> Result<(), String> {
     }
     let _ = app.emit("model-status", "loading");
 
+    let use_gpu = status.use_gpu.load(Ordering::Relaxed);
+
     let result = (|| {
         let model_path = resolve_model_path(app)?;
-        let environment = ort::init()
-            .with_name("koutu")
-            .build()
-            .map_err(|e| e.to_string())?;
-        Session::builder(&environment)
-            .map_err(|e| e.to_string())?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| e.to_string())?
-            .with_intra_threads(
-                std::thread::available_parallelism()
-                    .map(|n| n.get().min(8))
-                    .unwrap_or(4),
-            )
-            .map_err(|e| e.to_string())?
-            .with_execution_providers([ort::ep::CPU::default().with_arena_allocator(false).build()])
-            .map_err(|e| e.to_string())?
-            .commit_from_file(&model_path)
-            .map_err(|e| format!("模型加载失败: {e}"))
+        match build_session(&model_path, use_gpu, true) {
+            Ok(session) => Ok((session, "gpu")),
+            Err(gpu_err) => {
+                if !use_gpu {
+                    return Err(gpu_err);
+                }
+                // GPU EP 注册失败（如无 DX12 / 老系统 / 驱动异常）：
+                // 回退纯 CPU，保证任何机器都能正常使用
+                eprintln!("GPU 加速不可用（{gpu_err}），已回退 CPU 模式");
+                build_session(&model_path, false, false).map(|s| (s, "cpu"))
+            }
+        }
     })();
 
     let mut st = status.state.lock().map_err(|_| "状态锁失败".to_string())?;
     match result {
-        Ok(session) => {
+        Ok((session, backend)) => {
             let inference = app.state::<InferenceState>();
             let mut slot = inference
                 .session
@@ -382,7 +521,11 @@ fn load_model(app: &AppHandle, status: &ModelStatus) -> Result<(), String> {
                 .map_err(|_| "推理会话锁失败".to_string())?;
             *slot = Some(session);
             *st = ModelState::Ready;
-            let _ = app.emit("model-status", "ready");
+            if let Ok(mut b) = status.backend.lock() {
+                *b = backend.to_string();
+            }
+            // 就绪事件带后端信息：ready:gpu / ready:cpu
+            let _ = app.emit("model-status", format!("ready:{backend}"));
         }
         Err(e) => {
             *st = ModelState::Error(e.clone());
@@ -392,9 +535,10 @@ fn load_model(app: &AppHandle, status: &ModelStatus) -> Result<(), String> {
     Ok(())
 }
 
-// 重新加载模型（加载失败后重试）
+// 重新加载模型（加载失败后重试，或切换 GPU 加速开关）
 #[tauri::command]
-fn reload_model(app: AppHandle, status: State<ModelStatus>) -> Result<(), String> {
+fn reload_model(use_gpu: bool, app: AppHandle, status: State<ModelStatus>) -> Result<(), String> {
+    status.use_gpu.store(use_gpu, Ordering::Relaxed);
     load_model(&app, &status)
 }
 
@@ -438,7 +582,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            app.manage(ModelStatus { state: Mutex::new(ModelState::Loading) });
+            app.manage(ModelStatus {
+                state: Mutex::new(ModelState::Loading),
+                use_gpu: AtomicBool::new(true),
+                backend: Mutex::new("cpu".to_string()),
+            });
             app.manage(InferenceState { session: Mutex::new(None) });
             let status = app.state::<ModelStatus>();
             load_model(app.handle(), &status)?;
@@ -447,6 +595,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             read_image,
             save_png,
+            resize_png,
             segment_image,
             erase_region,
             get_model_status,
@@ -592,6 +741,51 @@ mod erase_tests {
         let png = make_result_png();
         let err = erase_region(png, 150, 50, 30);
         assert!(err.is_err(), "点在透明区应报错");
+    }
+}
+
+#[cfg(test)]
+mod defringe_tests {
+    use super::*;
+
+    // 3x3：四周是不透明红色前景，中心是半透明白色（模拟白底残留杂边）
+    // defringe 后中心颜色应被替换为红色
+    #[test]
+    fn test_defringe_replaces_edge_color_with_foreground() {
+        let mut rgb = image::RgbImage::new(3, 3);
+        for (_, _, p) in rgb.enumerate_pixels_mut() {
+            *p = image::Rgb([220, 30, 30]); // 红色前景
+        }
+        rgb.get_pixel_mut(1, 1).0 = [255, 255, 255]; // 白色杂边
+        let mut alpha = vec![255u8; 9];
+        alpha[4] = 128; // 中心半透明
+
+        defringe(&mut rgb, &alpha, 3, 3);
+        assert_eq!(rgb.get_pixel(1, 1).0, [220, 30, 30], "杂边颜色应被前景色替换");
+    }
+
+    // 完全不透明像素和完全透明像素的颜色不应被改动
+    #[test]
+    fn test_defringe_leaves_solid_pixels_alone() {
+        let mut rgb = image::RgbImage::new(2, 1);
+        rgb.get_pixel_mut(0, 0).0 = [10, 200, 50];
+        rgb.get_pixel_mut(1, 0).0 = [99, 99, 99];
+        let alpha = vec![255u8, 0];
+        defringe(&mut rgb, &alpha, 2, 1);
+        assert_eq!(rgb.get_pixel(0, 0).0, [10, 200, 50]);
+        // 透明像素找不到邻近不透明色时保持原样
+        assert_eq!(rgb.get_pixel(1, 0).0, [99, 99, 99]);
+    }
+
+    // remap_alpha：low 以下清零，high 以上 255，中间线性
+    #[test]
+    fn test_remap_alpha() {
+        let mut a = vec![0u8, 50, 128, 200, 255];
+        remap_alpha(&mut a, 70.0, 185.0);
+        assert_eq!(a[0], 0);
+        assert_eq!(a[1], 0); // 50 < 70 -> 0
+        assert_eq!(a[3], 255); // 200 > 185 -> 255
+        assert!((a[2] as i32) > 100 && (a[2] as i32) < 160, "中间值应线性过渡，实际 {}", a[2]);
     }
 }
 
