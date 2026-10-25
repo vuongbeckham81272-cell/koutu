@@ -18,7 +18,7 @@ jobs:
           - platform: windows-latest
             args: "--bundles nsis"
           - platform: macos-14
-            args: "--bundles dmg --target aarch64-apple-darwin"
+            args: "--bundles dmg"
     runs-on: ${{ matrix.platform }}
     env:
       MACOSX_DEPLOYMENT_TARGET: 13.4
