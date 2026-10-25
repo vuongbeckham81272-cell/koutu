@@ -18,31 +18,41 @@ jobs:
           - platform: windows-latest
             args: "--bundles nsis"
           - platform: macos-14
-            args: "--bundles dmg"
+            args: "--bundles app"
     runs-on: ${{ matrix.platform }}
     env:
       MACOSX_DEPLOYMENT_TARGET: 13.4
     steps:
       - uses: actions/checkout@v4
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 22
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
       - name: macOS linker fix
         if: matrix.platform == 'macos-14'
         run: |
           RD=$(clang --print-resource-dir)
           echo "RUSTFLAGS=-C link-arg=-target -C link-arg=arm64-apple-macos13.4.0 -C link-arg=-L$RD/lib/darwin -C link-arg=-lclang_rt.osx" >> "$GITHUB_ENV"
-      - name: Download BiRefNet model
+
+      - name: Download BiRefNet model (fp16, ~520MB)
         shell: bash
         run: |
           mkdir -p src-tauri/models
           curl -sL --retry 3 -o src-tauri/models/BiRefNet.onnx \
-            "https://huggingface.co/onnx-community/BiRefNet-ONNX/resolve/main/onnx/model.onnx"
+            "https://huggingface.co/onnx-community/BiRefNet-ONNX/resolve/main/onnx/model_fp16.onnx"
+
+      - name: Verify model loads on CPU (fp16 check)
+        run: cd src-tauri && cargo test 2>&1 | tail -40
+        timeout-minutes: 25
+
       - name: Install frontend dependencies
         run: npm ci
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -50,8 +60,19 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "硬边抠图 ${{ github.ref_name }}"
-          releaseBody: |
-            本地离线 AI 抠图工具。模型随安装包分发，无需联网。
-            提供 Windows（x64）与 macOS（Apple Silicon）两个版本。
           releaseDraft: false
           args: ${{ matrix.args }}
+
+      - name: Package Windows portable zip
+        if: matrix.platform == 'windows-latest'
+        run: |
+          Copy-Item -Recurse -Force src-tauri/models src-tauri/target/release/models
+          Compress-Archive -Force -Path src-tauri/target/release/koutu.exe, src-tauri/target/release/models -DestinationPath koutu-portable.zip
+        shell: pwsh
+
+      - name: Upload Windows portable zip to release
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" koutu-portable.zip --clobber
