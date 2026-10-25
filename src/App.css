@@ -333,3 +333,64 @@
 .status.error {
   color: #e07a7a;
 }
+
+/* ---------- 魔法橡皮擦（需求 9） ---------- */
+
+.eraser-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 14px;
+  font-size: 13px;
+  border-radius: 8px;
+  border: 1px solid #5a6b8c;
+  background: transparent;
+  color: #8fa3c8;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background-color 0.15s;
+}
+
+.eraser-btn:hover {
+  border-color: #7d9bd4;
+  color: #cdd6e8;
+}
+
+/* 激活态：绿色高亮，提示当前处于擦除模式 */
+.eraser-btn.active {
+  border-color: #7dd48f;
+  color: #7dd48f;
+  background: rgba(125, 212, 143, 0.12);
+}
+
+.tolerance-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: #8fa3c8;
+}
+
+.tolerance-row input[type="range"] {
+  width: 180px;
+  accent-color: #7dd48f;
+  cursor: pointer;
+}
+
+.tolerance-value {
+  min-width: 24px;
+  color: #7dd48f;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 擦除模式下光标显示为十字（吸管感） */
+.preview-wrap.erasing,
+.preview-wrap.erasing .preview-img {
+  cursor: crosshair;
+}
+
+.preview-wrap.erasing:active,
+.preview-wrap.erasing .preview-img:active {
+  cursor: crosshair;
+}

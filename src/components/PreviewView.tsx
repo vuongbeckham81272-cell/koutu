@@ -30,6 +30,7 @@ export default function PreviewView({
   const containerRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const dragRef = useRef<{ x: number; y: number; tx: number; ty: number } | null>(null);
+  const downPosRef = useRef<{ x: number; y: number } | null>(null);
   const layoutRef = useRef<{ iw: number; ih: number }>({ iw: 0, ih: 0 });
 
   // 切换图片时重置变换
@@ -73,15 +74,20 @@ export default function PreviewView({
 
   const onMouseDown = (e: ReactMouseEvent) => {
     if (e.button !== 0) return; // 仅左键
+    downPosRef.current = { x: e.clientX, y: e.clientY };
     dragRef.current = { x: e.clientX, y: e.clientY, tx: transform.tx, ty: transform.ty };
   };
 
   const onDoubleClick = () => {
+    if (mode === "erase") return; // 擦除模式下双击不打开选图，避免误触
     onRequestPick?.();
   };
 
   const onClick = (e: ReactMouseEvent) => {
     if (mode !== "erase") return;
+    // 拖拽平移后的松手不算"点击擦除"：位移超过 4px 忽略
+    const d = downPosRef.current;
+    if (d && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 4) return;
     const p = toImageCoords(e.clientX, e.clientY);
     if (p) onEraseClick?.(p);
   };
@@ -111,7 +117,10 @@ export default function PreviewView({
   }
 
   return (
-    <div className="preview-wrap" ref={containerRef}>
+    <div
+      className={`preview-wrap${mode === "erase" ? " erasing" : ""}`}
+      ref={containerRef}
+    >
       <img
         ref={imgRef}
         src={src}

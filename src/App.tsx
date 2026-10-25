@@ -4,9 +4,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { downloadDir } from "@tauri-apps/api/path";
 import PreviewView from "./components/PreviewView";
 import BatchList from "./components/BatchList";
-import type { BatchItem, ModelStatus, Stage } from "./types";
+import type { BatchItem, ErasePoint, ModelStatus, Stage } from "./types";
 import "./App.css";
 
 const SUPPORTED = ["png", "jpg", "jpeg", "webp", "bmp"];
@@ -43,8 +44,11 @@ function App() {
   const [modelError, setModelError] = useState("");
   const [stage, setStage] = useState<Stage>("idle");
   const [status, setStatus] = useState("");
-  const [hardEdge, setHardEdge] = useState(true);
+  const [hardEdge, setHardEdge] = useState(false);
+  const [smoothEdge, setSmoothEdge] = useState(true);
   const [view, setView] = useState<"original" | "result">("result");
+  const [eraseMode, setEraseMode] = useState(false);
+  const [tolerance, setTolerance] = useState(30);
   const [originalUrl, setOriginalUrl] = useState<string | null>(null);
   const [resultUrl, setResultUrl] = useState<string | null>(null);
   const [resultBytes, setResultBytes] = useState<Uint8Array | null>(null);
@@ -62,6 +66,8 @@ function App() {
   modelStatusRef.current = modelStatus;
   const hardEdgeRef = useRef(hardEdge);
   hardEdgeRef.current = hardEdge;
+  const smoothEdgeRef = useRef(smoothEdge);
+  smoothEdgeRef.current = smoothEdge;
 
   const currentBatchIdRef = useRef<string | null>(null);
   const lastDropTsRef = useRef(0);
@@ -163,6 +169,7 @@ function App() {
       const png = await invoke<number[]>("segment_image", {
         imageBytes: bytes,
         hardEdge: hardEdgeRef.current,
+        smooth: smoothEdgeRef.current,
       });
       const ru8 = new Uint8Array(png);
       setResultBytes(ru8);
@@ -175,32 +182,8 @@ function App() {
     }
   }, []);
 
-  // 从字节直接处理（HTML5 拖放兜底，无路径）
-  const processBytes = useCallback(async (bytes: Uint8Array, name: string) => {
-    if (modelStatusRef.current !== "ready") {
-      setStatus("模型尚未就绪，请等待加载完成");
-      return;
-    }
-    setStage("inference");
-    setSourcePath("");
-    setView("result");
-    try {
-      setStatus("处理中...");
-      setOriginalUrl(bytesToDataUrl(bytes));
-      const png = await invoke<number[]>("segment_image", {
-        imageBytes: Array.from(bytes),
-        hardEdge: hardEdgeRef.current,
-      });
-      const ru8 = new Uint8Array(png);
-      setResultBytes(ru8);
-      setResultUrl(bytesToDataUrl(ru8));
-      setStatus(`完成：${name}`);
-      setStage("done");
-    } catch (e) {
-      setStage("idle");
-      setStatus(`处理失败：${e}`);
-    }
-  }, []);
+  // 取文件所在的目录（去掉最后的文件名）
+  const dirOf = (p: string) => p.replace(/[\\/][^\\/]*$/, "");
 
   const enqueueBatch = useCallback(
     async (items: { path?: string; file?: File; name: string }[]) => {
@@ -210,8 +193,15 @@ function App() {
       }
       if (items.length === 0) return;
 
-      const outputDir = await open({ directory: true, title: "选择输出文件夹" });
-      if (typeof outputDir !== "string") return;
+      // 没有文件路径（纯 HTML5 拖入）时，回退到"下载"目录保存
+      let downloads = "";
+      if (items.some((it) => !it.path)) {
+        try {
+          downloads = (await downloadDir()) ?? "";
+        } catch {
+          downloads = "";
+        }
+      }
 
       const queue: BatchItem[] = items.map((it) => ({
         id: uid(),
@@ -243,8 +233,12 @@ function App() {
           const png = await invoke<number[]>("segment_image", {
             imageBytes: Array.from(bytes),
             hardEdge: hardEdgeRef.current,
+            smooth: smoothEdgeRef.current,
           });
-          const outPath = `${outputDir}/${cutoutName(item.name)}`;
+          // 自动保存到：有原始路径则存回原图所在文件夹；否则存到下载目录
+          const outDir = item.path ? dirOf(item.path) : downloads;
+          const outName = cutoutName(item.name);
+          const outPath = `${outDir}/${outName}`;
           await invoke("save_png", { bytes: Array.from(png), path: outPath });
           setBatchQueue((q) =>
             q.map((x) => (x.id === item.id ? { ...x, status: "done", progress: 100 } : x)),
@@ -262,32 +256,38 @@ function App() {
       }
       currentBatchIdRef.current = null;
       setBatchRunning(false);
-      setStatus(
-        `批量完成：${queue.filter((x) => x.status === "done").length}/${queue.length} 张 → ${outputDir}`,
-      );
+      const done = queue.filter((x) => x.status === "done").length;
+      const folderHint = items.some((it) => !it.path)
+        ? "（无路径的图已存到下载目录）"
+        : "（已存回原图所在文件夹）";
+      setStatus(`批量完成：${done}/${queue.length} 张${folderHint}`);
     },
     [],
   );
 
   const routeByCount = useCallback(
     (paths: string[]) => {
-      if (paths.length === 1) processFile(paths[0]);
-      else enqueueBatch(paths.map((p) => ({ path: p, name: baseName(p) })));
+      // 需求 1：单张图片不能在界面外拖入，只能单击操作区选择；
+      // 拖入只接受"多张"（即需求 5 的批量拖入）
+      if (paths.length === 1) {
+        setStatus("单张图片请直接单击操作区选择；如需批量，请一次性拖入多张图片");
+        return;
+      }
+      enqueueBatch(paths.map((p) => ({ path: p, name: baseName(p) })));
     },
-    [processFile, enqueueBatch],
+    [enqueueBatch],
   );
 
   const routeFilesByCount = useCallback(
     (files: File[]) => {
+      // 同上：单张不允许拖入，只走单击；此处兜底仅在 Tauri 未拦截时触发
       if (files.length === 1) {
-        files[0]
-          .arrayBuffer()
-          .then((buf) => processBytes(new Uint8Array(buf), files[0].name));
-      } else {
-        enqueueBatch(files.map((f) => ({ file: f, name: f.name })));
+        setStatus("单张图片请直接单击操作区选择；如需批量，请一次性拖入多张图片");
+        return;
       }
+      enqueueBatch(files.map((f) => ({ file: f, name: f.name })));
     },
-    [processBytes, enqueueBatch],
+    [enqueueBatch],
   );
 
   const pickFile = useCallback(async () => {
@@ -315,16 +315,40 @@ function App() {
     }
   }, [resultBytes, sourcePath]);
 
-  // 批量处理：选多张图片文件（不再选文件夹）
+  // 批量处理：按需求 3，只选"文件夹"，自动处理其中所有支持的图片
   const batchProcess = useCallback(async () => {
     if (busy) return;
-    const paths = await open({
-      multiple: true,
-      filters: [{ name: "图片", extensions: SUPPORTED }],
-    });
-    if (!paths || paths.length === 0) return;
-    enqueueBatch(paths.map((p) => ({ path: p, name: baseName(p) })));
+    const dir = await open({ directory: true, title: "选择包含图片的文件夹" });
+    if (typeof dir !== "string") return;
+    const names = await invoke<string[]>("list_image_files", { dir });
+    if (!names || names.length === 0) {
+      setStatus("该文件夹内没有支持的图片（PNG / JPG / JPEG / WebP / BMP）");
+      return;
+    }
+    enqueueBatch(names.map((n) => ({ path: `${dir}/${n}`, name: n })));
   }, [busy, enqueueBatch]);
+
+  // 魔法橡皮擦（需求 9）：点击处开始，清除连在一起的同色/相近色前景
+  const handleErase = useCallback(
+    async (p: ErasePoint) => {
+      if (!resultBytes) return;
+      try {
+        const png = await invoke<number[]>("erase_region", {
+          imageBytes: Array.from(resultBytes),
+          x: p.x,
+          y: p.y,
+          tolerance,
+        });
+        const ru8 = new Uint8Array(png);
+        setResultBytes(ru8);
+        setResultUrl(bytesToDataUrl(ru8));
+        setStatus("已擦除一块连通区域，可继续点击擦除；擦错请点右上角 × 重来");
+      } catch (e) {
+        setStatus(`擦除失败：${e}`);
+      }
+    },
+    [resultBytes, tolerance],
+  );
 
   // 清空结果，回到初始态
   const closeResult = useCallback(() => {
@@ -334,6 +358,7 @@ function App() {
     setSourcePath("");
     setStage("idle");
     setView("result");
+    setEraseMode(false);
     setStatus("");
   }, []);
 
@@ -363,7 +388,7 @@ function App() {
       <header className="header">
         <h1>一键抠图 · 硬边输出</h1>
         <div className="header-row">
-          <label className="toggle">
+          <label className="toggle" title="不勾选 = 平滑羽化边缘（默认，接近 PS 钢笔级干净轮廓）；勾选 = 纯硬边 0/255 二值">
             <input
               type="checkbox"
               checked={hardEdge}
@@ -371,6 +396,15 @@ function App() {
               disabled={running || batchRunning}
             />
             硬边模式
+          </label>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={smoothEdge}
+              onChange={(e) => setSmoothEdge(e.target.checked)}
+              disabled={running || batchRunning}
+            />
+            边缘平滑
           </label>
           <div className="view-toggle">
             <button
@@ -395,7 +429,37 @@ function App() {
                 ? "模型就绪"
                 : "模型加载失败"}
           </span>
+          {resultUrl && (
+            <button
+              className={`eraser-btn${eraseMode ? " active" : ""}`}
+              title="魔法橡皮擦：点击图中颜色，擦除连在一起的同色/相近色区域"
+              onClick={() => {
+                setEraseMode((m) => !m);
+                setView("result");
+              }}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="m2 22 1-1h3l9-9" />
+                <path d="M3 21v-3l9-9" />
+                <path d="m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.4.4a2.1 2.1 0 1 1-3 3l-3.8-3.8a2.1 2.1 0 1 1 3-3l.4.4Z" />
+              </svg>
+              魔法橡皮擦
+            </button>
+          )}
         </div>
+        {resultUrl && eraseMode && (
+          <div className="tolerance-row">
+            <span>容差（越大擦得越多）</span>
+            <input
+              type="range"
+              min={5}
+              max={100}
+              value={tolerance}
+              onChange={(e) => setTolerance(Number(e.target.value))}
+            />
+            <span className="tolerance-value">{tolerance}</span>
+          </div>
+        )}
       </header>
 
       <section
@@ -419,7 +483,7 @@ function App() {
             <div className="spinner" />
             <p>
               {stage === "inference"
-                ? "推理中（约 8~15 秒）..."
+                ? "推理中（约 20~35 秒，请稍候）..."
                 : stage === "postprocess"
                   ? "后处理中..."
                   : "编码中..."}
@@ -431,6 +495,8 @@ function App() {
           <PreviewView
             src={view === "original" ? originalUrl! : resultUrl!}
             alt={view === "original" ? "原图" : "抠图结果"}
+            mode={eraseMode && view === "result" ? "erase" : "none"}
+            onEraseClick={handleErase}
             onRequestPick={pickFile}
             onClose={resultUrl ? closeResult : undefined}
           />
