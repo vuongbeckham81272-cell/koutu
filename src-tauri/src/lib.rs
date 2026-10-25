@@ -418,6 +418,15 @@ fn resolve_model_path(app: &AppHandle) -> Result<PathBuf, String> {
             return Ok(c.clone());
         }
     }
+    // 3. 便携版：可执行文件同级目录下的 models/
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let p = parent.join("models/BiRefNet.onnx");
+            if p.exists() {
+                return Ok(p);
+            }
+        }
+    }
     Err(format!(
         "找不到模型文件，请确认安装包内包含 models/BiRefNet.onnx"
     ))
@@ -521,8 +530,8 @@ mod tests {
         assert_eq!(center, &image::Rgba([245, 245, 245, 255]));
         assert_eq!(corner, &image::Rgba([30, 60, 40, 0]));
 
-        out.save("/workspace/test_hard_edge.png").unwrap();
-        println!("硬边 PNG 已保存: /workspace/test_hard_edge.png");
+        let _ = out.save(std::env::temp_dir().join("test_hard_edge.png"));
+        println!("硬边 PNG 已保存(临时目录)");
 
         // ---- 软边模式（对比）----
         let png_soft = segment_image_core(&state, None, &img_bytes, false, false).unwrap();
@@ -537,8 +546,8 @@ mod tests {
             soft_keys.iter().any(|k| *k != 0 && *k != 255),
             "软边应存在中间值，否则对比测试无意义"
         );
-        out_soft.save("/workspace/test_soft_edge.png").unwrap();
-        println!("软边 PNG 已保存: /workspace/test_soft_edge.png");
+        let _ = out_soft.save(std::env::temp_dir().join("test_soft_edge.png"));
+        println!("软边 PNG 已保存(临时目录)");
     }
 }
 
