@@ -39,8 +39,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p src-tauri/models
-          curl -sL --retry 3 -o src-tauri/models/BiRefNet_lite.onnx \
-            "https://huggingface.co/onnx-community/BiRefNet_lite-ONNX/resolve/main/onnx/model.onnx"
+          curl -sL --retry 3 -o src-tauri/models/BiRefNet.onnx \
+            "https://huggingface.co/onnx-community/BiRefNet-ONNX/resolve/main/onnx/model.onnx"
       - name: Install frontend dependencies
         run: npm ci
       - name: Build Tauri app
